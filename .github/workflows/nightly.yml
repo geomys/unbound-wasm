@@ -1,0 +1,24 @@
+name: Nightly
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reproducibility:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: make module && cp unbound.wasm /tmp/first.wasm
+      - run: rm -rf build/work && make module
+      - run: cmp /tmp/first.wasm unbound.wasm
+  live-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - run: go run ./cmd/unbound-wasm-resolve -timeout=20s example.com A
+      - run: go run ./cmd/unbound-wasm-resolve -timeout=20s dnssec-failed.org A || true

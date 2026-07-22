@@ -1,0 +1,24 @@
+unbound-wasm
+Copyright (c) 2026, The unbound-wasm Authors.
+
+This product packages and builds upon Unbound, the recursive DNS resolver and
+DNSSEC validator by NLnet Labs.
+
+  Unbound
+  Copyright (c) 2007, NLnet Labs. All rights reserved.
+  https://github.com/NLnetLabs/unbound
+  Licensed under the BSD 3-Clause License.
+
+unbound-wasm is an independent distribution of Unbound. It is not an NLnet Labs
+project and is not endorsed by NLnet Labs.
+
+The embedded WebAssembly module is compiled from the pinned upstream Unbound
+release named in versions.mk, with the patches in patches/ and the backends in
+backends/ applied. See build/build-module.sh for the exact build.
+
+The module statically links the WASI libc from the WebAssembly wasi-sdk
+(https://github.com/WebAssembly/wasi-sdk), whose components carry their own
+permissive licenses (Apache-2.0 WITH LLVM-exception, and others). No OpenSSL or
+other TLS/crypto library is linked: DNSSEC cryptography is provided by the host.
+
+This project as a whole is licensed under the BSD 3-Clause License; see LICENSE.

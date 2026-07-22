@@ -1,0 +1,17 @@
+{
+  "abi": "0",
+  "endianness": "little",
+  "pointer_bits": 32,
+  "result": {
+    "size": 32,
+    "fields": [
+      {"name":"sec_status","offset":0,"type":"u32"},
+      {"name":"rcode","offset":4,"type":"u32"},
+      {"name":"why_bogus_ptr","offset":8,"type":"ptr"},
+      {"name":"why_bogus_len","offset":12,"type":"u32"},
+      {"name":"answer_packet_ptr","offset":16,"type":"ptr"},
+      {"name":"answer_packet_len","offset":20,"type":"u32"},
+      {"name":"reserved","offset":24,"type":"u32[2]"}
+    ]
+  }
+}

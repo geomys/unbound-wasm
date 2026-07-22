@@ -1,0 +1,12 @@
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG WASI_SDK_TAG=wasi-sdk-33
+ARG WASI_SDK_VERSION=33.0
+ARG WASI_SDK_SHA256=0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce
+RUN apt-get update && apt-get install -y --no-install-recommends binutils ca-certificates curl make gawk file patch python3 git xz-utils && rm -rf /var/lib/apt/lists/*
+RUN curl -fL --retry 3 -o /tmp/wasi-sdk.tar.gz "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_SDK_TAG}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz" \
+ && echo "${WASI_SDK_SHA256}  /tmp/wasi-sdk.tar.gz" | sha256sum -c - \
+ && mkdir -p /opt/wasi-sdk && tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1 \
+ && rm /tmp/wasi-sdk.tar.gz
+ENV WASI_SDK=/opt/wasi-sdk
+WORKDIR /src
+CMD ["build/build-module.sh"]
