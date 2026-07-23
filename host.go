@@ -54,12 +54,42 @@ type instanceState struct {
 	done       chan struct{}
 	once       sync.Once
 	err        error // shutdown cause, set before done is closed; nil on ordinary close
+	guestMu    sync.Mutex
+	modDead    bool // set under guestMu once the module is closed
 	socketsMu  sync.Mutex
 	sockets    map[int32]*hostSocket
 	nextSocket int32
 	timersMu   sync.Mutex
 	timers     map[uint64]*time.Timer
 	nextTimer  atomic.Uint64
+}
+
+// guest runs fn holding the lock that closeModule takes before closing the
+// wasm module, so the module — and with it the mmap backing its linear
+// memory — cannot be freed while fn calls into the guest or reads guest
+// memory. After closeModule, guest fails with ErrClosed.
+func (s *instanceState) guest(fn func() error) error {
+	s.guestMu.Lock()
+	defer s.guestMu.Unlock()
+	if s.modDead {
+		return ErrClosed
+	}
+	return fn()
+}
+
+// closeModule closes the wasm module, waiting first for any in-flight
+// guest call. The wait is short: guest calls never block, because no host
+// import blocks. Closing the module frees its linear memory, which the
+// memory allocator unmaps, so it must be unreachable first: that is what
+// guestMu guarantees. Callers may not hold guestMu.
+func (s *instanceState) closeModule(ctx context.Context) error {
+	s.guestMu.Lock()
+	defer s.guestMu.Unlock()
+	s.modDead = true
+	if s.mod == nil {
+		return nil
+	}
+	return s.mod.Close(ctx)
 }
 
 // errEventQueueOverflow fails an instance whose bounded event buffer filled

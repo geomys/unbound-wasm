@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Thu, 23 Jul 2026 17:30:00 +0200
+Subject: [PATCH] util: do not preallocate alloc cache regional blocks
+
+Every worker alloc cache preallocated max_reg_blocks (100) regional
+blocks of 16384 bytes at alloc_init, 1.6 MB per libunbound context
+before the first query. The preallocation only reduces contention on
+the super alloc under threading; in a single-threaded embedding the
+blocks are pure startup cost, and on wasm the linear memory they force
+can never be returned.
+
+Allocate regional blocks on demand instead, and keep at most 10 on the
+free list, enough for a resolution's steady state of mesh query states.
+---
+
+--- a/util/alloc.c
++++ b/util/alloc.c
+@@ -113,13 +113,13 @@
+ 	alloc->last_id -= 1; 			/* for compiler portability. */
+ 	alloc->last_id |= alloc->next_id;
+ 	alloc->next_id += 1;			/* because id=0 is special. */
+-	alloc->max_reg_blocks = 100;
++	alloc->max_reg_blocks = 10;
+ 	alloc->num_reg_blocks = 0;
+ 	alloc->reg_list = NULL;
+ 	alloc->cleanup = NULL;
+ 	alloc->cleanup_arg = NULL;
+ 	if(alloc->super)
+-		prealloc_blocks(alloc, alloc->max_reg_blocks);
++		prealloc_blocks(alloc, 0);
+ 	if(!alloc->super) {
+ 		lock_quick_init(&alloc->lock);
+ 		lock_protect(&alloc->lock, alloc, sizeof(*alloc));

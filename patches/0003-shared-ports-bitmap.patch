@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Thu, 23 Jul 2026 17:30:00 +0200
+Subject: [PATCH] services: store shared ports availability as a bitmap
+
+Each shared_ports_if kept the available outgoing ports as an array of
+ints, about 252 KB per interface with the default 1024-65535 range, and
+libunbound allocates them per context. A 65536-bit bitmap indexed by
+port number holds the same set in 8 KB.
+
+Selection stays uniform: a random index below the number of available
+ports is drawn as before, and the index-th set bit is located with a
+byte-wise popcount scan and cleared. Fetch and return keep their
+signatures and locking, so callers and the DISABLE_EXPLICIT_PORT_
+RANDOMISATION variant are unchanged.
+---
+
+--- a/services/outside_network.h
++++ b/services/outside_network.h
+@@ -274,10 +274,10 @@
+ 	/** if a netblock, the prefix */
+ 	int pfxlen;
+ 
+-	/** the available ports array. These are unused.
+-	 * Only the first total-inuse part is filled. */
+-	int* avail_ports;
+-	/** the total number of available ports (size of the array) */
++	/** bitmap of available (currently unused) port numbers,
++	 * indexed by port number, 65536 bits. */
++	uint8_t* avail_bits;
++	/** the total number of ports (set bits plus the ports in use) */
+ 	int avail_total;
+ 	/** the number in use. */
+ 	int inuse;
+--- a/services/outside_network.c
++++ b/services/outside_network.c
+@@ -4032,14 +4032,53 @@
+ }
+ 
+ #ifndef DISABLE_EXPLICIT_PORT_RANDOMISATION
++/** Remove and return the num-th available port from the bitmap, with
++ * num counting the set bits from 0 in port number order. Returns -1 if
++ * num is not smaller than the number of set bits. */
++static int shared_ports_take_avail(struct shared_ports_if* shpif, int num)
++{
++	int i, bit;
++	for(i=0; i<65536/8; i++) {
++		uint8_t b = shpif->avail_bits[i];
++		int c;
++		if(!b)
++			continue;
++		/* popcount of the byte */
++		c = b - ((b>>1)&0x55);
++		c = (c&0x33) + ((c>>2)&0x33);
++		c = (c + (c>>4)) & 0x0f;
++		if(num >= c) {
++			num -= c;
++			continue;
++		}
++		for(bit=0; bit<8; bit++) {
++			if((b>>bit)&1) {
++				if(num == 0) {
++					shpif->avail_bits[i] &=
++						(uint8_t)~(1<<bit);
++					return i*8 + bit;
++				}
++				num--;
++			}
++		}
++	}
++	return -1;
++}
++
+ /** Setup shared port interface */
+ static int shared_ports_setup_if(struct shared_ports_if* shpif, char* str,
+ 	int* availports, int numavailports)
+ {
+-	shpif->avail_ports = (int*)memdup(availports,
+-		(size_t)numavailports*sizeof(int));
+-	if(!shpif->avail_ports)
++	int i;
++	shpif->avail_bits = (uint8_t*)calloc(1, 65536/8);
++	if(!shpif->avail_bits)
+ 		return 0;
++	for(i=0; i<numavailports; i++) {
++		if(availports[i] < 0 || availports[i] > 65535)
++			continue;
++		shpif->avail_bits[availports[i]/8] |=
++			(uint8_t)(1<<(availports[i]%8));
++	}
+ 	shpif->avail_total = numavailports;
+ 	shpif->inuse = 0;
+ 	shpif->pfxlen = 0;
+@@ -4135,7 +4174,7 @@
+ {
+ 	if(!shpif)
+ 		return;
+-	free(shpif->avail_ports);
++	free(shpif->avail_bits);
+ }
+ #endif
+ 
+@@ -4232,10 +4271,13 @@
+ 		my_port -= reusenum;
+ 	}
+ 	log_assert(shpif->inuse < shpif->avail_total);
+-	log_assert(my_port >= 0 && my_port < shpif->avail_total);
+-	portno = shpif->avail_ports[my_port];
+-	shpif->avail_ports[my_port] =
+-		shpif->avail_ports[shpif->avail_total-shpif->inuse-1];
++	log_assert(my_port >= 0 &&
++		my_port < shpif->avail_total - shpif->inuse);
++	portno = shared_ports_take_avail(shpif, my_port);
++	if(portno == -1) {
++		lock_basic_unlock(&shp->lock);
++		return 0;
++	}
+ 	shpif->inuse++;
+ 	lock_basic_unlock(&shp->lock);
+ 	*port = portno;
+@@ -4258,7 +4300,8 @@
+ 		return;
+ 	lock_basic_lock(&shp->lock);
+ 	log_assert(shpif->inuse > 0);
+-	shpif->avail_ports[shpif->avail_total - shpif->inuse] = port;
++	log_assert(port >= 0 && port <= 65535);
++	shpif->avail_bits[port/8] |= (uint8_t)(1<<(port%8));
+ 	shpif->inuse--;
+ 	lock_basic_unlock(&shp->lock);
+ #else

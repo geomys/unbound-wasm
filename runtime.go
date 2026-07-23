@@ -17,6 +17,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
 )
 
 // The ABI is unstable while at v0: the embedded module and this host are
@@ -105,6 +106,9 @@ func (r *Runtime) Close(ctx context.Context) error {
 	r.mu.Unlock()
 	for _, state := range states {
 		state.close()
+		// Close each module before the wazero runtime sweeps it, so the
+		// teardown serializes with in-flight guest calls (see closeModule).
+		state.closeModule(ctx)
 	}
 	return r.wazero.Close(ctx)
 }
@@ -123,7 +127,10 @@ func (r *Runtime) NewInstance(ctx context.Context) (*Instance, error) {
 	r.mu.Unlock()
 
 	mc := wazero.NewModuleConfig().WithName(name).WithStartFunctions("_initialize")
-	mod, err := r.wazero.InstantiateModule(ctx, r.compiled, mc)
+	// The allocator only applies to the guest's linear memory: the host
+	// modules instantiated at Runtime creation define no memories.
+	mod, err := r.wazero.InstantiateModule(
+		experimental.WithMemoryAllocator(ctx, guestMemoryAllocator), r.compiled, mc)
 	if err != nil {
 		r.removeState(name)
 		state.close()
@@ -136,7 +143,7 @@ func (r *Runtime) NewInstance(ctx context.Context) (*Instance, error) {
 		return nil, err
 	}
 
-	out, err := inst.abiVersion.Call(ctx)
+	out, err := inst.call(ctx, inst.abiVersion)
 	if err != nil {
 		inst.Close(ctx)
 		return nil, fmt.Errorf("unbound: read ABI version: %w", err)
@@ -208,6 +215,17 @@ type Instance struct {
 	resolveCancel api.Function
 }
 
+// call invokes a guest export under the instance's guest lock, so the
+// module cannot be torn down mid-call. See instanceState.guest.
+func (i *Instance) call(ctx context.Context, f api.Function, params ...uint64) (out []uint64, err error) {
+	err = i.state.guest(func() error {
+		var cerr error
+		out, cerr = f.Call(ctx, params...)
+		return cerr
+	})
+	return out, err
+}
+
 // Name returns the unique random identifier of this Instance, of the form
 // "unbound-" followed by [rand.Text]. It tags every log line the Instance
 // emits, so it can correlate external records (such as validation evidence)
@@ -246,7 +264,7 @@ func (i *Instance) initialize(ctx context.Context, cfg, anchors, hints []byte) e
 		ptrs[n] = p
 		defer i.free(context.Background(), p, uint32(len(v)))
 	}
-	out, err := i.initFn.Call(ctx, uint64(ptrs[0]), uint64(len(cfg)), uint64(ptrs[1]), uint64(len(anchors)), uint64(ptrs[2]), uint64(len(hints)))
+	out, err := i.call(ctx, i.initFn, uint64(ptrs[0]), uint64(len(cfg)), uint64(ptrs[1]), uint64(len(anchors)), uint64(ptrs[2]), uint64(len(hints)))
 	if err != nil {
 		return fmt.Errorf("unbound: guest init: %w", err)
 	}
@@ -293,7 +311,7 @@ func (i *Instance) Resolve(ctx context.Context, name string, qtype uint16) (*Res
 		return nil, err
 	}
 	const classIN = 1
-	out, err := i.resolveStart.Call(ctx, uint64(p), uint64(len(name)), uint64(qtype), classIN)
+	out, err := i.call(ctx, i.resolveStart, uint64(p), uint64(len(name)), uint64(qtype), classIN)
 	i.free(context.Background(), p, uint32(len(name)))
 	if err != nil {
 		return nil, i.kill(fmt.Errorf("unbound: resolve_start: %w", err))
@@ -343,9 +361,9 @@ func (i *Instance) dispatch(ctx context.Context, ev hostEvent) error {
 	var err error
 	switch ev.kind {
 	case eventIO:
-		_, err = i.ioReady.Call(ctx, uint64(uint32(ev.sid)), uint64(uint32(ev.flags)))
+		_, err = i.call(ctx, i.ioReady, uint64(uint32(ev.sid)), uint64(uint32(ev.flags)))
 	case eventTimer:
-		_, err = i.timerFired.Call(ctx, uint64(ev.tid))
+		_, err = i.call(ctx, i.timerFired, uint64(ev.tid))
 	}
 	if err != nil {
 		return i.kill(fmt.Errorf("unbound: dispatch event: %w", err))
@@ -360,45 +378,59 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 		return nil, false, err
 	}
 	defer i.free(context.Background(), p, resultSize)
-	out, err := i.resultGet.Call(ctx, uint64(uint32(rid)), uint64(p))
-	if err != nil {
-		return nil, false, i.kill(fmt.Errorf("unbound: result_get: %w", err))
+	// The guest call and the reads of the result structure it points into
+	// must happen under one guest block: nothing may touch guest memory
+	// once the module is closed and its memory unmapped. Only copies of
+	// the buffers escape the block; i.kill takes the same lock, so it runs
+	// on the collected error afterwards.
+	var rc int32
+	var secStatus, cbRcode uint32
+	var why, packet []byte
+	gerr := i.state.guest(func() error {
+		out, err := i.resultGet.Call(ctx, uint64(uint32(rid)), uint64(p))
+		if err != nil {
+			return fmt.Errorf("unbound: result_get: %w", err)
+		}
+		rc = int32(uint32(out[0]))
+		if rc <= 0 {
+			return nil
+		}
+		b, ok := i.mod.Memory().Read(p, resultSize)
+		if !ok {
+			return errors.New("unbound: result structure outside guest memory")
+		}
+		word := func(off int) uint32 { return binary.LittleEndian.Uint32(b[off : off+4]) }
+		read := func(ptr, n uint32) ([]byte, error) {
+			if n == 0 {
+				return nil, nil
+			}
+			if n > 65535 {
+				return nil, errors.New("unbound: result buffer exceeds ABI limit")
+			}
+			v, ok := i.mod.Memory().Read(ptr, n)
+			if !ok {
+				return nil, errors.New("unbound: result buffer outside guest memory")
+			}
+			return append([]byte(nil), v...), nil
+		}
+		secStatus, cbRcode = word(0), word(4)
+		if why, err = read(word(8), word(12)); err != nil {
+			return err
+		}
+		packet, err = read(word(16), word(20))
+		return err
+	})
+	if gerr != nil {
+		return nil, false, i.kill(gerr)
 	}
-	rc := int32(uint32(out[0]))
 	if rc == 0 {
 		return nil, false, nil
 	}
 	if rc < 0 {
 		return nil, false, fmt.Errorf("unbound: result_get failed: wasi errno %d", -rc)
 	}
-	b, ok := i.mod.Memory().Read(p, resultSize)
-	if !ok {
-		return nil, false, i.kill(errors.New("unbound: result structure outside guest memory"))
-	}
-	word := func(off int) uint32 { return binary.LittleEndian.Uint32(b[off : off+4]) }
-	read := func(ptr, n uint32) ([]byte, error) {
-		if n == 0 {
-			return nil, nil
-		}
-		if n > 65535 {
-			return nil, errors.New("unbound: result buffer exceeds ABI limit")
-		}
-		v, ok := i.mod.Memory().Read(ptr, n)
-		if !ok {
-			return nil, errors.New("unbound: result buffer outside guest memory")
-		}
-		return append([]byte(nil), v...), nil
-	}
-	why, err := read(word(8), word(12))
-	if err != nil {
-		return nil, false, i.kill(err)
-	}
-	packet, err := read(word(16), word(20))
-	if err != nil {
-		return nil, false, i.kill(err)
-	}
 	const secStatusSecure, secStatusBogus = 1, 2
-	if word(0) == secStatusBogus {
+	if secStatus == secStatusBogus {
 		return nil, false, &BogusError{Reason: string(why), EDE: parseEDE(packet)}
 	}
 	const rcodeNoError, rcodeNXDomain = 0, 3
@@ -406,7 +438,7 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 	// for answers that did resolve, it is NOERROR and the DNS rcode
 	// (NOERROR vs NXDOMAIN) is in the answer packet header, like
 	// upstream's ub_resolve reads it from the reply flags.
-	rcode := int(word(4))
+	rcode := int(cbRcode)
 	if rcode == rcodeNoError && len(packet) >= 4 {
 		rcode = int(packet[3] & 0xf)
 	}
@@ -414,7 +446,7 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 		return nil, false, &ResponseError{RCode: rcode, EDE: parseEDE(packet)}
 	}
 	res := &Result{
-		Secure:       word(0) == secStatusSecure,
+		Secure:       secStatus == secStatusSecure,
 		NXDomain:     rcode == rcodeNXDomain,
 		AnswerPacket: packet,
 	}
@@ -430,33 +462,40 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 }
 
 func (i *Instance) allocWrite(ctx context.Context, b []byte) (uint32, error) {
-	n := len(b)
-	if n == 0 {
-		n = 1
-	}
-	out, err := i.alloc.Call(ctx, uint64(n))
+	var p uint32
+	err := i.state.guest(func() error {
+		n := len(b)
+		if n == 0 {
+			n = 1
+		}
+		out, err := i.alloc.Call(ctx, uint64(n))
+		if err != nil {
+			return fmt.Errorf("unbound: alloc: %w", err)
+		}
+		p = uint32(out[0])
+		if p == 0 {
+			return errors.New("unbound: guest allocation failed")
+		}
+		if len(b) > 0 && !i.mod.Memory().Write(p, b) {
+			return errors.New("unbound: guest allocation outside memory")
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, fmt.Errorf("unbound: alloc: %w", err)
-	}
-	p := uint32(out[0])
-	if p == 0 {
-		return 0, errors.New("unbound: guest allocation failed")
-	}
-	if len(b) > 0 && !i.mod.Memory().Write(p, b) {
-		return 0, errors.New("unbound: guest allocation outside memory")
+		return 0, err
 	}
 	return p, nil
 }
 
 func (i *Instance) free(ctx context.Context, p, n uint32) {
 	if p != 0 {
-		_, _ = i.dealloc.Call(ctx, uint64(p), uint64(n))
+		_, _ = i.call(ctx, i.dealloc, uint64(p), uint64(n))
 	}
 }
 
 func (i *Instance) cancel(ctx context.Context, rid int32) {
 	if !i.closed.Load() {
-		_, _ = i.resolveCancel.Call(ctx, uint64(uint32(rid)))
+		_, _ = i.call(ctx, i.resolveCancel, uint64(uint32(rid)))
 	}
 }
 
@@ -469,12 +508,14 @@ func (i *Instance) kill(err error) error {
 
 // Close aborts any in-flight resolution, closes the instance's sockets and
 // timers, and frees its sandbox memory. It is idempotent, and after Close all
-// methods return [ErrClosed].
+// methods return [ErrClosed]. A Close concurrent with a Resolve waits for the
+// guest call in flight, if any, before freeing the sandbox memory; guest
+// calls always return promptly, because no host import blocks.
 func (i *Instance) Close(ctx context.Context) error {
 	if i == nil || !i.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 	i.state.close()
 	i.runtime.removeState(i.name)
-	return i.mod.Close(ctx)
+	return i.state.closeModule(ctx)
 }

@@ -550,7 +550,7 @@ func resolveDriven(t *testing.T, net *replayNet, inst *Instance, name string, qt
 		t.Fatal(err)
 	}
 	const classIN = 1
-	out, err := inst.resolveStart.Call(ctx, uint64(p), uint64(len(name)), uint64(qtype), classIN)
+	out, err := inst.call(ctx, inst.resolveStart, uint64(p), uint64(len(name)), uint64(qtype), classIN)
 	inst.free(ctx, p, uint32(len(name)))
 	if err != nil {
 		t.Fatal(err)

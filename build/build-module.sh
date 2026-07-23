@@ -141,9 +141,11 @@ PY
 			-I. -I"$ROOT" -I"$ROOT/backends" \
 			-c "$ROOT/backends/$f.c" -o "$WORK/$f.o"
 	done
+	# The 1 MiB stack is ~5x the deepest observed use; the layout is
+	# stack-first, so overflow traps instead of corrupting data.
 	"$WASI_SDK/bin/clang" -O2 -mexec-model=reactor \
 		-Wl,--allow-undefined -Wl,--gc-sections -Wl,--strip-all \
-		-Wl,-z,stack-size=2097152 \
+		-Wl,-z,stack-size=1048576 \
 		-o "$OUT" \
 		"$WORK/guest.o" "$WORK/event.o" "$WORK/sockets.o" "$WORK/compat.o" \
 		.libs/libunbound.a -lwasi-emulated-signal

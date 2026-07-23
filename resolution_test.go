@@ -383,6 +383,30 @@ func TestResolveContextCancellation(t *testing.T) {
 	}
 }
 
+// TestResolveConcurrentClose closes the Instance from another goroutine in
+// the middle of a resolution. Close must serialize with in-flight guest
+// calls: the instance's linear memory is unmapped at close, so a call (or
+// host-side memory read) racing the teardown would fault.
+func TestResolveConcurrentClose(t *testing.T) {
+	env := newTestEnv(t, algECDSA256, nil)
+	env.net.realTime = true
+	env.auth.intercept = func(parsedQuery, []byte) []delivery { return nil } // black hole
+	inst, err := env.rt.NewInstance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		inst.Close(context.Background())
+	}()
+	if _, err := inst.Resolve(context.Background(), "www.example.gotest", TypeA); err == nil {
+		t.Fatal("Resolve succeeded despite concurrent Close")
+	}
+	if _, err := inst.Resolve(context.Background(), "www.example.gotest", TypeA); !errors.Is(err, ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed after Close", err)
+	}
+}
+
 func TestResolveUnsupportedAlgorithmIsInsecure(t *testing.T) {
 	env := newTestEnv(t, algECDSA256, func(e *testEnv) {
 		// Re-key the leaf zone with an algorithm the host does not
