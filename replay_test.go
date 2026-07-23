@@ -560,8 +560,13 @@ func resolveDriven(t *testing.T, net *replayNet, inst *Instance, name string, qt
 		t.Fatalf("resolve_start: errno %d", -rid)
 	}
 	defer inst.cancel(ctx, rid)
+	rp, err := inst.allocWrite(ctx, make([]byte, resultSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inst.free(ctx, rp, resultSize)
 	for range 10000 {
-		res, ready, err := inst.pollResult(ctx, rid, name, qtype)
+		res, ready, _, err := inst.pollResult(ctx, rid, rp, name, qtype)
 		if err != nil {
 			return nil, err
 		}

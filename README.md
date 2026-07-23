@@ -23,6 +23,9 @@ defer inst.Close(ctx)
 result, err := inst.Resolve(ctx, "example.com.", unbound.TypeA)
 ```
 
+`Instance.ResolveAll` resolves a batch of related queries — such as one
+validation's A, AAAA, TXT, and CAA lookups — concurrently on one instance.
+
 `abi/README.md` is the normative ABI and embedder guide. The SDK always runs
 the embedded `unbound.wasm`, whose SHA-256 is pinned in the package and
 checked by tests.

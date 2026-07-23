@@ -383,6 +383,124 @@ func TestResolveContextCancellation(t *testing.T) {
 	}
 }
 
+// TestResolveAll runs a validation-set-shaped batch — A, AAAA, TXT, and CAA
+// — concurrently on one instance.
+func TestResolveAll(t *testing.T) {
+	env := newTestEnv(t, algECDSA256, nil)
+	env.net.realTime = true
+	inst, err := env.rt.NewInstance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inst.Close(context.Background())
+	results, err := inst.ResolveAll(context.Background(), []Query{
+		{"www.example.gotest", TypeA},
+		{"www.example.gotest", TypeAAAA},
+		{"www.example.gotest", TypeTXT},
+		{"example.gotest", TypeCAA},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 4 {
+		t.Fatalf("got %d results, want 4", len(results))
+	}
+	if a := results[0]; !a.Secure || len(a.Addrs()) != 2 {
+		t.Fatalf("A: Secure=%v addrs=%v", a.Secure, a.Addrs())
+	}
+	if aaaa := results[1]; !aaaa.Secure || aaaa.HaveData {
+		t.Fatalf("AAAA: Secure=%v HaveData=%v, want secure NODATA", aaaa.Secure, aaaa.HaveData)
+	}
+	if txt := results[2]; len(txt.TXT()) != 1 || txt.TXT()[0] != "hello world" {
+		t.Fatalf("TXT = %q", txt.TXT())
+	}
+	if caa := results[3]; len(caa.CAA()) != 1 || caa.CAA()[0].Value != "ca.example" {
+		t.Fatalf("CAA = %+v", caa.CAA())
+	}
+}
+
+func TestResolveAllPartialFailure(t *testing.T) {
+	env := newTestEnv(t, algECDSA256, nil)
+	env.net.realTime = true
+	stripSigs(env.leaf, "www.example.gotest.", TypeA)
+	inst, err := env.rt.NewInstance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inst.Close(context.Background())
+	queries := []Query{
+		{"www.example.gotest", TypeA},
+		{"www.example.gotest", TypeTXT},
+		{"", TypeA}, // fails validation before reaching the guest
+	}
+	results, err := inst.ResolveAll(context.Background(), queries)
+	if results[0] != nil || results[2] != nil || results[1] == nil {
+		t.Fatalf("results = %v, want only the TXT query to succeed", results)
+	}
+	if !results[1].Secure || len(results[1].TXT()) != 1 {
+		t.Fatalf("TXT: Secure=%v TXT=%q", results[1].Secure, results[1].TXT())
+	}
+	var bogus *BogusError
+	if !errors.As(err, &bogus) {
+		t.Fatalf("error %v does not include a BogusError", err)
+	}
+	// Each failure carries its query, so callers can pair them up.
+	var qe *QueryError
+	if !errors.As(err, &qe) || qe.Query != queries[0] {
+		t.Fatalf("first QueryError = %+v, want query %+v", qe, queries[0])
+	}
+	if !strings.Contains(err.Error(), "empty name") {
+		t.Fatalf("error %v does not report the empty name", err)
+	}
+}
+
+// TestResolveAllEmpty: an empty batch must not touch the guest — in
+// particular, with a canceled context it must not kill the instance and
+// report success — and on a closed instance it must report ErrClosed even
+// with no query to attach it to.
+func TestResolveAllEmpty(t *testing.T) {
+	env := newTestEnv(t, algECDSA256, nil)
+	inst, err := env.rt.NewInstance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inst.Close(context.Background())
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if results, err := inst.ResolveAll(canceled, nil); err != nil || len(results) != 0 {
+		t.Fatalf("empty batch: results=%v err=%v", results, err)
+	}
+	// The instance must still work.
+	if res, err := resolveDriven(t, env.net, inst, "www.example.gotest", TypeA); err != nil || !res.Secure {
+		t.Fatalf("resolve after empty batch: %v, %v", res, err)
+	}
+
+	inst.Close(context.Background())
+	if _, err := inst.ResolveAll(context.Background(), nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("empty batch on closed instance: %v, want ErrClosed", err)
+	}
+}
+
+func TestResolveAllClosed(t *testing.T) {
+	env := newTestEnv(t, algECDSA256, nil)
+	inst, err := env.rt.NewInstance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.Close(context.Background())
+	results, err := inst.ResolveAll(context.Background(), []Query{
+		{"www.example.gotest", TypeA},
+		{"www.example.gotest", TypeTXT},
+	})
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed", err)
+	}
+	if len(results) != 2 || results[0] != nil || results[1] != nil {
+		t.Fatalf("results = %v, want two nils", results)
+	}
+}
+
 // TestResolveConcurrentClose closes the Instance from another goroutine in
 // the middle of a resolution. Close must serialize with in-flight guest
 // calls: the instance's linear memory is unmapped at close, so a call (or

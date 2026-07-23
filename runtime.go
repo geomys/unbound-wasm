@@ -192,10 +192,13 @@ func (r *Runtime) removeState(name string) {
 // An Instance is a recursive resolver running in its own wasm sandbox, with
 // its own memory, caches, and sockets.
 //
-// An Instance resolves one query at a time and is not safe for concurrent
-// use, except for [Instance.Close]. For parallel queries, use one Instance
-// per in-flight query: instances are cheap, and answers are never cached,
-// so even sequential queries on a shared Instance are each resolved fresh.
+// An Instance runs one Resolve or ResolveAll call at a time and is not safe
+// for concurrent use, except for [Instance.Close]. Related queries that
+// share a fate — such as one validation's A, AAAA, TXT, and CAA lookups —
+// belong in a single [Instance.ResolveAll] batch, which resolves them
+// concurrently in one sandbox. Independent resolutions belong on separate
+// Instances; answers are never cached, so every query is resolved fresh
+// either way.
 type Instance struct {
 	runtime *Runtime
 	state   *instanceState
@@ -274,6 +277,27 @@ func (i *Instance) initialize(ctx context.Context, cfg, anchors, hints []byte) e
 	return nil
 }
 
+// A Query is one name and type for [Instance.ResolveAll]. The name is
+// interpreted as fully qualified (the trailing dot is optional), in the IN
+// class.
+type Query struct {
+	Name string
+	Type uint16
+}
+
+// A QueryError reports the failure of one query of an [Instance.ResolveAll]
+// batch.
+type QueryError struct {
+	Query Query
+	Err   error
+}
+
+func (e *QueryError) Error() string {
+	return fmt.Sprintf("unbound: query %q type %d: %v", e.Query.Name, e.Query.Type, e.Err)
+}
+
+func (e *QueryError) Unwrap() error { return e.Err }
+
 // Resolve recursively resolves and validates name, which is interpreted as
 // fully qualified (the trailing dot is optional), in the IN class.
 //
@@ -285,11 +309,153 @@ func (i *Instance) initialize(ctx context.Context, cfg, anchors, hints []byte) e
 // Transient failures surface as [ResponseError] and are not retried; callers
 // with retry policies should retry on a fresh Instance.
 func (i *Instance) Resolve(ctx context.Context, name string, qtype uint16) (*Result, error) {
-	if i == nil || i.closed.Load() {
-		return nil, ErrClosed
+	results, err := i.ResolveAll(ctx, []Query{{Name: name, Type: qtype}})
+	if err != nil {
+		// Unwrap the QueryError so single-query callers see the exact
+		// BogusError, ResponseError, or context error.
+		var qe *QueryError
+		if errors.As(err, &qe) {
+			return nil, qe.Err
+		}
+		return nil, err
 	}
+	return results[0], nil
+}
+
+// ResolveAll resolves and validates every query concurrently within the
+// instance, sharing its sockets and event loop. It returns one result per
+// query, in order: results[i] is nil if and only if queries[i] failed, and
+// the returned error joins a [QueryError] per failure (nil if every query
+// succeeded). Per-query failures are the same as [Instance.Resolve]'s:
+// [BogusError] for answers that fail DNSSEC validation, [ResponseError] for
+// failed resolutions.
+//
+// A batch shares the instance's fate: if ctx is canceled mid-resolution the
+// whole Instance is closed, and an instance failure fails every unsettled
+// query. The guest caps a batch at 64 concurrent queries; queries past its
+// capacity fail with an errno error.
+func (i *Instance) ResolveAll(ctx context.Context, queries []Query) ([]*Result, error) {
+	results := make([]*Result, len(queries))
+	errs := make([]error, len(queries))
+	// failUnsettled reports err for every query that has not settled yet.
+	failUnsettled := func(err error) ([]*Result, error) {
+		for n := range queries {
+			if results[n] == nil && errs[n] == nil {
+				errs[n] = err
+			}
+		}
+		return results, joinQueryErrors(queries, errs)
+	}
+	if i == nil || i.closed.Load() {
+		if len(queries) == 0 {
+			// failUnsettled has no query to attach the error to.
+			return nil, ErrClosed
+		}
+		return failUnsettled(ErrClosed)
+	}
+
+	names := make([]string, len(queries))
+	rids := make([]int32, len(queries)) // 0 while not started
+	defer func() {
+		// Free the guest result slots, settled or not.
+		for _, rid := range rids {
+			if rid > 0 {
+				i.cancel(context.Background(), rid)
+			}
+		}
+	}()
+	pending := 0
+	for n, q := range queries {
+		name, err := normalizeName(q.Name)
+		if err != nil {
+			errs[n] = err
+			continue
+		}
+		names[n] = name
+		p, err := i.allocWrite(ctx, []byte(name))
+		if err != nil {
+			return failUnsettled(err)
+		}
+		const classIN = 1
+		out, err := i.call(ctx, i.resolveStart, uint64(p), uint64(len(name)), uint64(q.Type), classIN)
+		i.free(context.Background(), p, uint32(len(name)))
+		if err != nil {
+			return failUnsettled(i.kill(fmt.Errorf("unbound: resolve_start: %w", err)))
+		}
+		rid := int32(uint32(out[0]))
+		if rid < 0 {
+			errs[n] = fmt.Errorf("unbound: resolve_start failed: wasi errno %d", -rid)
+			continue
+		}
+		rids[n] = rid
+		pending++
+	}
+	// With nothing in flight — an empty batch, or every query rejected
+	// before reaching the guest — don't touch the guest at all: an
+	// allocation failure here could not be attributed to any query.
+	if pending == 0 {
+		return results, joinQueryErrors(queries, errs)
+	}
+
+	p, err := i.allocWrite(ctx, make([]byte, resultSize))
+	if err != nil {
+		return failUnsettled(err)
+	}
+	defer i.free(context.Background(), p, resultSize)
+
+	for pending > 0 {
+		for n := range queries {
+			if rids[n] == 0 || results[n] != nil || errs[n] != nil {
+				continue
+			}
+			res, ready, fatal, err := i.pollResult(ctx, rids[n], p, names[n], queries[n].Type)
+			switch {
+			case fatal:
+				// The poll killed the instance; nothing else can settle.
+				return failUnsettled(err)
+			case err != nil:
+				errs[n] = err
+				pending--
+			case ready:
+				results[n] = res
+				pending--
+			}
+		}
+		if pending == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			i.Close(context.Background())
+			return failUnsettled(ctx.Err())
+		case <-i.state.done:
+			return failUnsettled(i.stateErr())
+		case ev, ok := <-i.state.events:
+			if !ok {
+				return failUnsettled(ErrClosed)
+			}
+			if err := i.dispatch(ctx, ev); err != nil {
+				return failUnsettled(err)
+			}
+		}
+	}
+	return results, joinQueryErrors(queries, errs)
+}
+
+func joinQueryErrors(queries []Query, errs []error) error {
+	var joined []error
+	for n, err := range errs {
+		if err != nil {
+			joined = append(joined, &QueryError{Query: queries[n], Err: err})
+		}
+	}
+	return errors.Join(joined...)
+}
+
+// normalizeName validates a query name and appends the root dot if missing.
+func normalizeName(name string) (string, error) {
 	if name == "" {
-		return nil, errors.New("unbound: empty name")
+		return "", errors.New("unbound: empty name")
 	}
 	// A NUL would truncate the name when the guest turns it into a C string,
 	// so "example.com.\x00.evil." would resolve example.com. while the host
@@ -297,54 +463,16 @@ func (i *Instance) Resolve(ctx context.Context, name string, qtype uint16) (*Res
 	// too long to be a valid presentation-format domain, before it reaches the
 	// guest.
 	if strings.IndexByte(name, 0) >= 0 {
-		return nil, errors.New("unbound: name contains NUL")
-	}
-	if len(name) > 1024 {
-		return nil, errors.New("unbound: name too long")
+		return "", errors.New("unbound: name contains NUL")
 	}
 	if name[len(name)-1] != '.' {
 		name += "."
 	}
-
-	p, err := i.allocWrite(ctx, []byte(name))
-	if err != nil {
-		return nil, err
+	// The bound applies to the normalized name, the form the guest sees.
+	if len(name) > 1024 {
+		return "", errors.New("unbound: name too long")
 	}
-	const classIN = 1
-	out, err := i.call(ctx, i.resolveStart, uint64(p), uint64(len(name)), uint64(qtype), classIN)
-	i.free(context.Background(), p, uint32(len(name)))
-	if err != nil {
-		return nil, i.kill(fmt.Errorf("unbound: resolve_start: %w", err))
-	}
-	rid := int32(uint32(out[0]))
-	if rid < 0 {
-		return nil, fmt.Errorf("unbound: resolve_start failed: wasi errno %d", -rid)
-	}
-	defer i.cancel(context.Background(), rid)
-
-	for {
-		res, ready, err := i.pollResult(ctx, rid, name, qtype)
-		if err != nil {
-			return nil, err
-		}
-		if ready {
-			return res, nil
-		}
-		select {
-		case <-ctx.Done():
-			i.Close(context.Background())
-			return nil, ctx.Err()
-		case <-i.state.done:
-			return nil, i.stateErr()
-		case ev, ok := <-i.state.events:
-			if !ok {
-				return nil, ErrClosed
-			}
-			if err := i.dispatch(ctx, ev); err != nil {
-				return nil, err
-			}
-		}
-	}
+	return name, nil
 }
 
 // stateErr reports why the instance shut down while Resolve was waiting for
@@ -371,13 +499,14 @@ func (i *Instance) dispatch(ctx context.Context, ev hostEvent) error {
 	return nil
 }
 
-func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtype uint16) (*Result, bool, error) {
-	const resultSize = 32
-	p, err := i.allocWrite(ctx, make([]byte, resultSize))
-	if err != nil {
-		return nil, false, err
-	}
-	defer i.free(context.Background(), p, resultSize)
+// resultSize is the size of the guest's result structure (abi/layout.json).
+const resultSize = 32
+
+// pollResult collects the result of rid if it is ready, writing the guest
+// result structure to p, a caller-allocated resultSize-byte buffer. A true
+// fatal reports an error that killed the instance, as opposed to an outcome
+// of this one query.
+func (i *Instance) pollResult(ctx context.Context, rid int32, p uint32, qname string, qtype uint16) (res *Result, ready, fatal bool, err error) {
 	// The guest call and the reads of the result structure it points into
 	// must happen under one guest block: nothing may touch guest memory
 	// once the module is closed and its memory unmapped. Only copies of
@@ -421,17 +550,17 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 		return err
 	})
 	if gerr != nil {
-		return nil, false, i.kill(gerr)
+		return nil, false, true, i.kill(gerr)
 	}
 	if rc == 0 {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	if rc < 0 {
-		return nil, false, fmt.Errorf("unbound: result_get failed: wasi errno %d", -rc)
+		return nil, false, false, fmt.Errorf("unbound: result_get failed: wasi errno %d", -rc)
 	}
 	const secStatusSecure, secStatusBogus = 1, 2
 	if secStatus == secStatusBogus {
-		return nil, false, &BogusError{Reason: string(why), EDE: parseEDE(packet)}
+		return nil, false, false, &BogusError{Reason: string(why), EDE: parseEDE(packet)}
 	}
 	const rcodeNoError, rcodeNXDomain = 0, 3
 	// The libunbound callback rcode is only set for resolution errors;
@@ -443,9 +572,9 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 		rcode = int(packet[3] & 0xf)
 	}
 	if rcode != rcodeNoError && rcode != rcodeNXDomain {
-		return nil, false, &ResponseError{RCode: rcode, EDE: parseEDE(packet)}
+		return nil, false, false, &ResponseError{RCode: rcode, EDE: parseEDE(packet)}
 	}
-	res := &Result{
+	res = &Result{
 		Secure:       secStatus == secStatusSecure,
 		NXDomain:     rcode == rcodeNXDomain,
 		AnswerPacket: packet,
@@ -455,10 +584,10 @@ func (i *Instance) pollResult(ctx context.Context, rid int32, qname string, qtyp
 	// cannot hold records of the queried type.
 	if rcode == rcodeNoError {
 		if err := res.parseAnswer(qname, qtype); err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
-	return res, true, nil
+	return res, true, false, nil
 }
 
 func (i *Instance) allocWrite(ctx context.Context, b []byte) (uint32, error) {
