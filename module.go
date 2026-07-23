@@ -7,7 +7,7 @@ var embeddedModule []byte
 
 // moduleSHA256 is the SHA-256 of unbound.wasm. It is updated by
 // `make module` and checked by TestEmbeddedModuleHash.
-const moduleSHA256 = "c0d6ee5fe1612535d9e75160a1fea03d9244b0cb75f3b2ecacea80ac623fc9ab"
+const moduleSHA256 = "25788d88431cb95a1c9fe519b3c1299491076d7c0c0bd0b62453cf1728a4253b"
 
 // defaultCanonicalConfig is the resolver configuration, applied line by line
 // through ub_ctx_set_option. It matches Let's Encrypt's Unbound configuration

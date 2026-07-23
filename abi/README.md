@@ -58,6 +58,8 @@ unbound_wasm_abi_version() -> i32
 alloc(len) -> ptr
 dealloc(ptr, len)
 init(cfg, clen, anchors, alen, hints, hlen) -> errno
+warmup() -> errno
+reseed()
 resolve_start(qname, len, qtype, qclass) -> rid
 io_ready(sid, flags)
 timer_fired(tid)
@@ -66,7 +68,21 @@ resolve_cancel(rid)
 ```
 
 `init` is called exactly once and must not call clock, entropy, socket, or timer
-imports. Names passed to `resolve_start` are presentation-format absolute DNS
+imports. `warmup` is optional: it runs all of the context setup that is
+otherwise deferred to the first `resolve_start` — it may use the clock and
+entropy imports, but opens no sockets and starts no timers, so an instance's
+memory right after a successful `warmup` contains no host resource identifiers
+and is a valid template for cloning into fresh instances. A host that clones
+must call `reseed` on each clone before resolving: it redraws the entropy-
+derived state `warmup` stored (the cache hash-table seed and the DNS Cookie
+server secret), which the clones would otherwise share. Clock reads during
+`warmup` leave no stored time behind — the one cached time is cleared, and
+resolutions stamp it fresh before use — and every other random value — query
+IDs, source ports, 0x20 case — is drawn from the entropy import at use, never
+stored. The reference host's differential warmup test enforces all three
+properties, so growth in stored entropy- or clock-derived state fails loudly
+on an upstream update rather than silently weakening clones. Names passed to
+`resolve_start` are presentation-format absolute DNS
 names and include a trailing dot. The guest owns result buffers until
 `resolve_cancel`, instance close, or a later documented invalidation; the host
 copies them before returning.

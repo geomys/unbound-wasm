@@ -5,8 +5,14 @@
 
 #include "config.h"
 #include "abi/unbound_wasm_abi.h"
+#include "libunbound/context.h"
+#include "libunbound/libworker.h"
 #include "libunbound/unbound.h"
 #include "libunbound/unbound-event.h"
+#include "util/config_file.h"
+#include "util/module.h"
+#include "util/netevent.h"
+#include "util/storage/lookup3.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -128,6 +134,33 @@ static int ensure_ctx(void) {
     return 0;
 }
 
+// ensure_worker performs the rest of the lazy setup that ub_resolve_event
+// would run on its first call — context_finalize and the event worker,
+// where nearly all of the context's memory is allocated — without starting
+// a query or touching the network. Like ensure_ctx failures, a failure is
+// sticky: a partially finalized context must not serve resolutions (or be
+// snapshotted by a warmup caller).
+static int ensure_worker(void) {
+    int r;
+    if (!ctx->finalized && (r = context_finalize(ctx)) != 0)
+        return ctx_err = ub_errno(r);
+    if (!ctx->event_worker) {
+        ctx->event_worker = libworker_create_event(ctx, ctx->event_base);
+        if (!ctx->event_worker)
+            return ctx_err = ENOMEM;
+    }
+    // Clear the comm_base cached time, the only stored value the setup
+    // derives from the clock imports: a snapshot must not carry the warmup
+    // time into clones. Every resolution stamps it fresh before use
+    // (ub_resolve_event calls ub_comm_base_now).
+    time_t *tt;
+    struct timeval *tv;
+    comm_base_timept(ctx->event_worker->base, &tt, &tv);
+    *tt = 0;
+    memset(tv, 0, sizeof(*tv));
+    return 0;
+}
+
 static void result_cb(void *arg, int rcode, void *packet, int packet_len,
                       int sec, char *why_bogus, int was_ratelimited) {
     (void)was_ratelimited;
@@ -184,6 +217,36 @@ int32_t guest_init(uint32_t cfg, uint32_t cfg_len, uint32_t anchors, uint32_t an
     if (!saved_cfg || !saved_anchors || !saved_hints)
         return -ENOMEM;
     return 0;
+}
+
+// warmup runs all of the deferred context setup, so that the host can
+// snapshot the instance's memory as a pre-initialized template. It uses the
+// clock and entropy imports (unlike init, which must not); it opens no
+// sockets and starts no timers, so the snapshot holds no host resource
+// identifiers. Resolutions work the same whether or not warmup ran first.
+UW_EXPORT("warmup")
+int32_t guest_warmup(void) {
+    int r = ensure_ctx();
+    if (!r)
+        r = ensure_worker();
+    return r ? -(int32_t)r : 0;
+}
+
+// reseed redraws the guest state that warmup derived from the entropy
+// import, so instances cloned from a warmed template do not share it. That
+// state is the cache hash-table seed and the DNS Cookie server secret
+// (unused without listeners, but redrawn rather than left shared in case a
+// future Unbound reads it): all other randomness (query IDs, source ports,
+// 0x20 case) is drawn from the host at each use and never stored.
+// TestZygoteWarmupDeterminism holds this list to account.
+UW_EXPORT("reseed")
+void guest_reseed(void) {
+    uint32_t seed;
+    uw_entropy(&seed, sizeof(seed));
+    hash_set_raninit(seed);
+    if (ctx && ctx->env && ctx->env->cfg && ctx->env->cfg->cookie_secret_len)
+        uw_entropy(ctx->env->cfg->cookie_secret,
+                   (uint32_t)ctx->env->cfg->cookie_secret_len);
 }
 
 UW_EXPORT("resolve_start")

@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math/rand/v2"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 )
@@ -83,6 +86,38 @@ func TestRuntimeCloseClosesInstances(t *testing.T) {
 	}
 	if _, err := rt.NewInstance(ctx); err == nil {
 		t.Fatal("NewInstance succeeded after runtime close")
+	}
+}
+
+// TestRuntimeCloseConcurrentNewInstance races instance creation — and, on
+// the first iteration of each runtime, the zygote initialization — against
+// Runtime.Close. Nothing may crash or race: registration is fenced under
+// r.mu, module publication under guestMu, and Close waits out the zygote
+// Once before reading r.zygote.
+func TestRuntimeCloseConcurrentNewInstance(t *testing.T) {
+	ctx := context.Background()
+	for range 5 {
+		rt, err := NewRuntime(ctx, Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				inst, err := rt.NewInstance(ctx)
+				if err == nil {
+					inst.Close(ctx)
+				}
+			}()
+		}
+		time.Sleep(time.Duration(rand.IntN(4)) * time.Millisecond)
+		rt.Close(ctx)
+		wg.Wait()
+		if _, err := rt.NewInstance(ctx); err == nil {
+			t.Fatal("NewInstance succeeded after Close")
+		}
 	}
 }
 

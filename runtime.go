@@ -37,6 +37,11 @@ type Runtime struct {
 	closed   atomic.Bool
 	mu       sync.RWMutex
 	states   map[string]*instanceState
+
+	// The zygote template, built by the first NewInstance; see zygote.go.
+	zygoteOnce sync.Once
+	zygote     *zygote
+	zygoteErr  error
 }
 
 // NewRuntime compiles the embedded resolver module.
@@ -97,6 +102,10 @@ func (r *Runtime) Close(ctx context.Context) error {
 	if r == nil || r.wazero == nil || !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// Wait out any in-flight zygote initialization, and mark the Once done
+	// so none starts later: the r.zygote read below is ordered after
+	// whichever initialization ran, and its image file cannot leak.
+	r.zygoteOnce.Do(func() {})
 	r.mu.Lock()
 	states := make([]*instanceState, 0, len(r.states))
 	for name, state := range r.states {
@@ -110,47 +119,109 @@ func (r *Runtime) Close(ctx context.Context) error {
 		// teardown serializes with in-flight guest calls (see closeModule).
 		state.closeModule(ctx)
 	}
-	return r.wazero.Close(ctx)
+	err := r.wazero.Close(ctx)
+	if r.zygote != nil {
+		// Existing mappings keep their own reference to the file.
+		r.zygote.file.Close()
+	}
+	return err
 }
 
 // NewInstance instantiates a fresh resolver with its own isolated memory and
-// empty caches.
+// empty caches. The first call builds the zygote template (see zygote.go),
+// so configuration problems that the guest only detects at context creation
+// surface here rather than at the first resolution.
 func (r *Runtime) NewInstance(ctx context.Context) (*Instance, error) {
 	if r == nil || r.compiled == nil || r.closed.Load() {
 		return nil, errors.New("unbound: nil or closed runtime")
 	}
+	// The template is built with a background context: it is shared setup,
+	// and must not be poisoned by the first caller's cancellation.
+	r.zygoteOnce.Do(func() { r.initZygote(context.Background()) })
+	if r.zygoteErr != nil {
+		return nil, r.zygoteErr
+	}
+	if r.zygote != nil {
+		return r.newClone(ctx)
+	}
+	return r.newFullInstance(ctx)
+}
+
+// newModuleInstance instantiates the compiled module with the given memory
+// allocator and registers its state. Clones skip the start functions: their
+// memory image is already past initialization.
+func (r *Runtime) newModuleInstance(ctx context.Context, alloc experimental.MemoryAllocator, start bool) (*Instance, error) {
 	name := "unbound-" + rand.Text()
 	state := newInstanceState(r.cfg.Log.With("instance", name))
 	state.replay = r.replay
+	// Registration is fenced against closure under r.mu: a state added
+	// while the runtime is open is guaranteed to be swept by Close's
+	// closeModule loop, and none can be added afterwards.
 	r.mu.Lock()
+	if r.closed.Load() {
+		r.mu.Unlock()
+		return nil, errors.New("unbound: closed runtime")
+	}
 	r.states[name] = state
 	r.mu.Unlock()
 
-	mc := wazero.NewModuleConfig().WithName(name).WithStartFunctions("_initialize")
+	mc := wazero.NewModuleConfig().WithName(name)
+	if start {
+		mc = mc.WithStartFunctions("_initialize")
+	} else {
+		mc = mc.WithStartFunctions()
+	}
 	// The allocator only applies to the guest's linear memory: the host
 	// modules instantiated at Runtime creation define no memories.
 	mod, err := r.wazero.InstantiateModule(
-		experimental.WithMemoryAllocator(ctx, guestMemoryAllocator), r.compiled, mc)
+		experimental.WithMemoryAllocator(ctx, alloc), r.compiled, mc)
 	if err != nil {
 		r.removeState(name)
 		state.close()
 		return nil, fmt.Errorf("unbound: instantiate module: %w", err)
 	}
+	// Publish the module under the guest lock: if a concurrent Close swept
+	// this state while it had no module yet, teardown has passed us by,
+	// and this module must be closed here instead of used.
+	state.guestMu.Lock()
+	if state.modDead {
+		state.guestMu.Unlock()
+		mod.Close(ctx)
+		r.removeState(name)
+		state.close()
+		return nil, errors.New("unbound: closed runtime")
+	}
 	state.mod = mod
+	state.guestMu.Unlock()
 	inst := &Instance{runtime: r, state: state, mod: mod, name: name}
 	if err := inst.bindExports(); err != nil {
 		inst.Close(ctx)
 		return nil, err
 	}
+	return inst, nil
+}
 
-	out, err := inst.call(ctx, inst.abiVersion)
+func (i *Instance) checkABIVersion(ctx context.Context) error {
+	out, err := i.call(ctx, i.abiVersion)
 	if err != nil {
-		inst.Close(ctx)
-		return nil, fmt.Errorf("unbound: read ABI version: %w", err)
+		return fmt.Errorf("unbound: read ABI version: %w", err)
 	}
 	if v := uint32(out[0]); v != abiVersion {
+		return fmt.Errorf("unbound: wasm ABI version mismatch: host v%d, guest v%d", abiVersion, v)
+	}
+	return nil
+}
+
+// newFullInstance takes the whole initialization path: instantiate, run
+// _initialize, and feed the configuration to the guest's init.
+func (r *Runtime) newFullInstance(ctx context.Context) (*Instance, error) {
+	inst, err := r.newModuleInstance(ctx, guestMemoryAllocator, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := inst.checkABIVersion(ctx); err != nil {
 		inst.Close(ctx)
-		return nil, fmt.Errorf("unbound: wasm ABI version mismatch: host v%d, guest v%d", abiVersion, v)
+		return nil, err
 	}
 	// On development machines without working IPv6, set
 	// UNBOUND_WASM_DISABLE_IPV6=1 so the iterator never selects IPv6
@@ -211,6 +282,8 @@ type Instance struct {
 	alloc         api.Function
 	dealloc       api.Function
 	initFn        api.Function
+	warmup        api.Function
+	reseed        api.Function
 	resolveStart  api.Function
 	ioReady       api.Function
 	timerFired    api.Function
@@ -248,6 +321,8 @@ func (i *Instance) bindExports() error {
 	i.alloc = lookup("alloc")
 	i.dealloc = lookup("dealloc")
 	i.initFn = lookup("init")
+	i.warmup = lookup("warmup")
+	i.reseed = lookup("reseed")
 	i.resolveStart = lookup("resolve_start")
 	i.ioReady = lookup("io_ready")
 	i.timerFired = lookup("timer_fired")
